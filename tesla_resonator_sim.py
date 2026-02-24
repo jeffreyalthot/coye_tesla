@@ -107,7 +107,13 @@ def compute_masses(assembly: Assembly) -> Dict[str, float]:
     }
 
 
-def integrate_motion(total_mass: float, net_force_xyz: Tuple[float, float, float], duration: float, dt: float) -> Tuple[List[Tuple[float, float, float]], Tuple[float, float, float]]:
+def integrate_motion(
+    total_mass: float,
+    net_force_xyz: Tuple[float, float, float],
+    duration: float,
+    dt: float,
+    floor_z: float = 0.0,
+) -> Tuple[List[Tuple[float, float, float]], Tuple[float, float, float]]:
     vx = vy = vz = 0.0
     x = y = z = 0.0
     ax = net_force_xyz[0] / total_mass
@@ -123,9 +129,35 @@ def integrate_motion(total_mass: float, net_force_xyz: Tuple[float, float, float
         x += vx * dt
         y += vy * dt
         z += vz * dt
+
+        if z < floor_z:
+            z = floor_z
+            if vz < 0:
+                vz = 0.0
+
         positions.append((x, y, z))
 
     return positions, (vx, vy, vz)
+
+
+def print_simulation_trace(positions: List[Tuple[float, float, float]], dt: float, samples: int = 12) -> None:
+    if not positions:
+        return
+
+    stride = max(1, len(positions) // samples)
+    print("\n=== Affichage de la simulation (échantillons) ===")
+    print(" temps(s) |   X(cm) |   Y(cm) |   Z(cm)")
+    print("-----------------------------------------")
+
+    for i in range(0, len(positions), stride):
+        x, y, z = positions[i]
+        t = (i + 1) * dt
+        print(f" {t:7.3f} | {x*100:7.2f} | {y*100:7.2f} | {z*100:7.2f}")
+
+    if (len(positions) - 1) % stride != 0:
+        x, y, z = positions[-1]
+        t = len(positions) * dt
+        print(f" {t:7.3f} | {x*100:7.2f} | {y*100:7.2f} | {z*100:7.2f}")
 
 
 def build_geometry(assembly: Assembly) -> Tuple[List[Tuple[float, float, float]], List[Tuple[float, float, float]]]:
@@ -214,7 +246,7 @@ def main() -> None:
     net_fx = 0.02 * net_fz
     net_fy = -0.015 * net_fz
 
-    positions, vel = integrate_motion(total_mass, (net_fx, net_fy, net_fz), 1.2, 0.002)
+    positions, vel = integrate_motion(total_mass, (net_fx, net_fy, net_fz), 1.2, 0.002, floor_z=0.0)
     final = positions[-1]
 
     rods_base, rods_tip = build_geometry(assembly)
@@ -238,6 +270,7 @@ def main() -> None:
     print(f"Force nette (x,y,z): ({net_fx:.3f}, {net_fy:.3f}, {net_fz:.3f}) N")
     print(f"Vitesse finale (x,y,z): ({vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}) m/s")
     print(f"Distance parcourue: X={final[0]*100:.2f} cm, Y={final[1]*100:.2f} cm, Z={final[2]*100:.2f} cm")
+    print_simulation_trace(positions, dt=0.002)
     print("Géométrie 3D exportée dans tesla_resonator_geometry.obj")
 
 
