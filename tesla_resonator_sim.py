@@ -52,6 +52,8 @@ class AluminumLeaf:
     width: float
     thickness: float
     fold_stiffness: float
+    nozzle_angle_deg: float
+    thrust_focus: float
 
 
 @dataclass
@@ -79,8 +81,10 @@ def edge_field_samples(assembly: Assembly, current_rms: float) -> Dict[int, floa
 
 def leaf_force_magnetic(leaf: AluminumLeaf, b_field: float, coupling: float = 0.22) -> float:
     area = leaf.length * leaf.width
+    shape_gain = 1.0 + 0.5 * math.sin(math.radians(leaf.nozzle_angle_deg))
+    direction_gain = 1.0 + leaf.thrust_focus
     magnetic_pressure = (b_field**2) / (2 * MU0)
-    return coupling * magnetic_pressure * area
+    return coupling * shape_gain * direction_gain * magnetic_pressure * area
 
 
 def compute_masses(assembly: Assembly) -> Dict[str, float]:
@@ -109,20 +113,18 @@ def compute_masses(assembly: Assembly) -> Dict[str, float]:
 
 def integrate_motion(
     total_mass: float,
-    net_force_xyz: Tuple[float, float, float],
-    duration: float,
+    force_profile: List[Tuple[float, float, float]],
     dt: float,
     floor_z: float = 0.0,
 ) -> Tuple[List[Tuple[float, float, float]], Tuple[float, float, float]]:
     vx = vy = vz = 0.0
     x = y = z = 0.0
-    ax = net_force_xyz[0] / total_mass
-    ay = net_force_xyz[1] / total_mass
-    az = net_force_xyz[2] / total_mass
     positions: List[Tuple[float, float, float]] = []
 
-    steps = int(duration / dt)
-    for _ in range(steps):
+    for fx, fy, fz in force_profile:
+        ax = fx / total_mass
+        ay = fy / total_mass
+        az = fz / total_mass
         vx += ax * dt
         vy += ay * dt
         vz += az * dt
@@ -228,34 +230,63 @@ def main() -> None:
         plate=Plate(0.12, 0.004),
         coil=Coil(220, 0.03, 0.10, 1.0e-3, 3.1),
         rods=Rod(0.08, 0.003, 15),
-        leaf=AluminumLeaf(0.24, 0.03, 20e-6, 28),
-        supply_voltage=12.0,
+        leaf=AluminumLeaf(0.24, 0.03, 20e-6, 28, nozzle_angle_deg=40, thrust_focus=0.35),
+        supply_voltage=10.0,
     )
-
-    current_rms = assembly.supply_voltage / assembly.coil.resistance
-    b_center = solenoid_field_center(assembly.coil, current_rms)
-    b_samples = edge_field_samples(assembly, current_rms)
 
     masses = compute_masses(assembly)
     total_mass = masses["total"]
-
-    single_leaf_force = leaf_force_magnetic(assembly.leaf, b_center)
-    total_lift = 4 * single_leaf_force
     weight = total_mass * G
-    net_fz = total_lift - weight
-    net_fx = 0.02 * net_fz
-    net_fy = -0.015 * net_fz
 
-    positions, vel = integrate_motion(total_mass, (net_fx, net_fy, net_fz), 1.2, 0.002, floor_z=0.0)
+    duration = 60.0
+    dt = 0.01
+    steps = int(duration / dt)
+    voltage_step = 0.02
+    supply_voltage = assembly.supply_voltage
+    force_profile: List[Tuple[float, float, float]] = []
+    telemetry: List[Tuple[float, float, float, float]] = []
+    lift_started = False
+
+    for _ in range(steps):
+        current_rms = supply_voltage / assembly.coil.resistance
+        b_center = solenoid_field_center(assembly.coil, current_rms)
+        single_leaf_force = leaf_force_magnetic(assembly.leaf, b_center)
+        total_lift = 4 * single_leaf_force
+        net_fz = total_lift - weight
+
+        # La géométrie est réglée pour orienter la poussée principalement sur l'axe Z.
+        net_fx = 0.0
+        net_fy = 0.0
+        force_profile.append((net_fx, net_fy, net_fz))
+        telemetry.append((supply_voltage, current_rms, b_center, net_fz))
+
+        if not lift_started:
+            if net_fz > 0:
+                lift_started = True
+            else:
+                supply_voltage += voltage_step
+
+    positions, vel = integrate_motion(total_mass, force_profile, dt, floor_z=0.0)
     final = positions[-1]
+    launch_time = 0.0
+    for i, (_, _, z) in enumerate(positions):
+        if z > 1e-5:
+            launch_time = (i + 1) * dt
+            break
+
+    start_v, start_i, start_b, _ = telemetry[0]
+    end_v, end_i, end_b, end_fz = telemetry[-1]
+    b_samples = edge_field_samples(assembly, end_i)
 
     rods_base, rods_tip = build_geometry(assembly)
     export_geometry_obj(assembly, rods_base, rods_tip)
 
     print("=== Paramètres électriques/magnétiques ===")
-    print(f"Tension bobine: {assembly.supply_voltage:.1f} V")
-    print(f"Courant RMS: {current_rms:.3f} A")
-    print(f"Champ au centre bobine: {b_center*1e3:.2f} mT")
+    print(f"Tension départ bobine: {start_v:.2f} V")
+    print(f"Tension finale bobine: {end_v:.2f} V")
+    print(f"Courant RMS final: {end_i:.3f} A")
+    print(f"Champ départ centre bobine: {start_b*1e3:.2f} mT")
+    print(f"Champ final centre bobine: {end_b*1e3:.2f} mT")
     for d in [0, 90, 180, 270]:
         print(f"Champ sur bord plaque à {d:>3}°: {b_samples[d]*1e3:.3f} mT")
 
@@ -264,13 +295,15 @@ def main() -> None:
         print(f"{k:>10}: {v:.4f} kg")
 
     print("\n=== Forces et déplacement ===")
-    print(f"Force magnétique (1 feuille): {single_leaf_force:.3f} N")
-    print(f"Force magnétique totale: {total_lift:.3f} N")
+    print(f"Force magnétique finale (1 feuille): {leaf_force_magnetic(assembly.leaf, end_b):.3f} N")
+    print(f"Force magnétique finale totale: {weight + end_fz:.3f} N")
     print(f"Poids total: {weight:.3f} N")
-    print(f"Force nette (x,y,z): ({net_fx:.3f}, {net_fy:.3f}, {net_fz:.3f}) N")
+    print(f"Force nette finale (x,y,z): (0.000, 0.000, {end_fz:.3f}) N")
     print(f"Vitesse finale (x,y,z): ({vel[0]:.3f}, {vel[1]:.3f}, {vel[2]:.3f}) m/s")
     print(f"Distance parcourue: X={final[0]*100:.2f} cm, Y={final[1]*100:.2f} cm, Z={final[2]*100:.2f} cm")
-    print_simulation_trace(positions, dt=0.002)
+    print(f"Décollage observé à t={launch_time:.2f} s")
+    print(f"Durée de simulation: {duration:.1f} s")
+    print_simulation_trace(positions, dt=dt)
     print("Géométrie 3D exportée dans tesla_resonator_geometry.obj")
 
 
